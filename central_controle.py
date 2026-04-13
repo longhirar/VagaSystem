@@ -61,6 +61,7 @@ def on_message(client, userdata, msg):
                 "distancia_cm": float(payload.get("distancia_cm", 0.0)),
                 "luz_ambiente": int(payload.get("luz_ambiente", 0)),
                 "brilho_led":   int(payload.get("brilho_led", 0)),
+                "umidade":      int(payload.get("umidade", 0)),
                 "last_update":  datetime.now().strftime("%H:%M:%S"),
             }
 
@@ -130,6 +131,7 @@ def draw_detail(id_vaga: str) -> None:
         print(f"  Distância:           {vaga['distancia_cm']:.1f} cm")
         print(f"  Luz ambiente (LDR):  {vaga['luz_ambiente']} / 4095")
         print(f"  Brilho LED (PWM):    {vaga['brilho_led']} / 1023")
+        print(f"  Umidade (DHT11):     {vaga['umidade']} %")
         print(f"  Última atualização:  {vaga['last_update']}")
 
     print("\nLOG (últimas mensagens)")
