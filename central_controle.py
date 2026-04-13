@@ -163,10 +163,16 @@ def main() -> None:
                 with state_lock:
                     vaga_list = sorted(vagas.values(), key=lambda v: v["id_vaga"])
                 idx = int(cmd) - 1
-                if 0 <= idx < len(vaga_list):
+                if not vaga_list:
+                    print("Nenhuma vaga disponível ainda. Aguarde...")
+                    input("Pressione Enter para continuar...")
+                elif 0 <= idx < len(vaga_list):
                     detail_id = vaga_list[idx]["id_vaga"]
                     screen    = "detail"
                     publish_command(client, TOPIC_CMD_VAGA.format(detail_id), "status")
+                else:
+                    print(f"Número inválido. Digite entre 1 e {len(vaga_list)}.")
+                    input("Pressione Enter para continuar...")
 
         elif screen == "detail":
             draw_detail(detail_id)
