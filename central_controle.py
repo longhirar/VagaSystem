@@ -1,12 +1,3 @@
-#!/usr/bin/env python3
-"""
-VagaSystem — Central de Controle
-MQTT + terminal simples (sem curses).
-
-- Thread MQTT (paho): recebe mensagens do broker em background.
-- Thread principal: exibe a tela e lê comandos do usuário.
-"""
-
 import json
 import os
 import threading
@@ -14,8 +5,6 @@ import uuid
 from datetime import datetime
 
 import paho.mqtt.client as mqtt
-
-# ── Configurações MQTT ─────────────────────────────────────────────────────────
 
 BROKER_HOST = "micros-ctba.microsdns.com.br"
 BROKER_PORT = 1883
@@ -25,9 +14,7 @@ TOPIC_SUB      = "vagasystem/+/status"
 TOPIC_CMD_VAGA = "vagasystem/{}/comandos"
 TOPIC_CMD_ALL  = "vagasystem/all/comandos"
 
-# ── Estado global (lido e escrito pelas duas threads) ──────────────────────────
-
-state_lock = threading.Lock()  # evita leitura e escrita ao mesmo tempo
+state_lock = threading.Lock()
 
 vagas: dict[str, dict] = {}
 log_messages: list[str] = []
@@ -36,7 +23,6 @@ mqtt_connected = False
 
 
 def _add_log(msg: str) -> None:
-    """Adiciona uma mensagem ao log."""
     ts = datetime.now().strftime("%H:%M:%S")
     with state_lock:
         log_messages.append(f"[{ts}] {msg}")
@@ -44,10 +30,7 @@ def _add_log(msg: str) -> None:
             log_messages.pop(0)
 
 
-# ── Callbacks MQTT ─────────────────────────────────────────────────────────────
-
 def on_connect(client, userdata, flags, rc, properties=None):
-    """Chamado quando o cliente conecta ao broker."""
     global mqtt_connected
     if rc == 0:
         mqtt_connected = True
@@ -59,14 +42,12 @@ def on_connect(client, userdata, flags, rc, properties=None):
 
 
 def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
-    """Chamado quando a conexão cai."""
     global mqtt_connected
     mqtt_connected = False
     _add_log(f"MQTT desconectado (rc={reason_code}). Reconectando...")
 
 
 def on_message(client, userdata, msg):
-    """Chamado a cada mensagem recebida. Atualiza o dicionário de vagas."""
     try:
         payload = json.loads(msg.payload.decode("utf-8"))
         id_vaga = str(payload.get("id_vaga", "")).strip()
@@ -92,16 +73,12 @@ def on_message(client, userdata, msg):
         _add_log(f"Erro inesperado: {e}")
 
 
-# ── MQTT público ───────────────────────────────────────────────────────────────
-
 def publish_command(client: mqtt.Client, topic: str, command: str) -> None:
-    """Publica um comando JSON e registra no log."""
     client.publish(topic, json.dumps({"comando": command}))
-    _add_log(f"CMD '{command}' → {topic}")
+    _add_log(f"CMD '{command}' -> {topic}")
 
 
 def start_mqtt() -> mqtt.Client:
-    """Cria o cliente MQTT e inicia a thread de rede em background."""
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=CLIENT_ID)
     client.on_connect    = on_connect
     client.on_disconnect = on_disconnect
@@ -112,13 +89,10 @@ def start_mqtt() -> mqtt.Client:
     return client
 
 
-# ── Exibição ───────────────────────────────────────────────────────────────────
-
 def draw_dashboard() -> None:
-    """Limpa a tela e exibe a lista de vagas."""
     os.system("clear")
     status = "CONECTADO" if mqtt_connected else "DESCONECTADO"
-    print(f"=== VagaSystem — Central de Controle  [{status}] ===\n")
+    print(f"VagaSystem — Central de Controle  [{status}]\n")
 
     with state_lock:
         vaga_list  = sorted(vagas.values(), key=lambda v: v["id_vaga"])
@@ -127,13 +101,13 @@ def draw_dashboard() -> None:
     if not vaga_list:
         print("  Aguardando dados das vagas...\n")
     else:
-        print(f"  {'Nº':<4}  {'ID':<8}  {'ESTADO':<10}  ATUALIZADO")
+        print(f"  {'Número':<4}  {'ID':<8}  {'ESTADO':<10}  ATUALIZADO")
         print(f"  {'─'*4}  {'─'*8}  {'─'*10}  {'─'*8}")
         for i, vaga in enumerate(vaga_list, start=1):
             estado = "OCUPADA" if vaga["ocupado"] else "LIVRE"
             print(f"  {i:<4}  {vaga['id_vaga']:<8}  {estado:<10}  {vaga['last_update']}")
 
-    print("\n--- LOG (últimas mensagens) ---")
+    print("\nLOG (últimas mensagens)")
     for linha in log_recent:
         print(f"  {linha}")
 
@@ -141,9 +115,8 @@ def draw_dashboard() -> None:
 
 
 def draw_detail(id_vaga: str) -> None:
-    """Limpa a tela e exibe os detalhes de uma vaga específica."""
     os.system("clear")
-    print(f"=== VagaSystem — Detalhes: Vaga {id_vaga} ===\n")
+    print(f"VagaSystem — Detalhes: Vaga {id_vaga}\n")
 
     with state_lock:
         vaga       = vagas.get(id_vaga)
@@ -159,17 +132,14 @@ def draw_detail(id_vaga: str) -> None:
         print(f"  Brilho LED (PWM):    {vaga['brilho_led']} / 1023")
         print(f"  Última atualização:  {vaga['last_update']}")
 
-    print("\n--- LOG (últimas mensagens) ---")
+    print("\nLOG (últimas mensagens)")
     for linha in log_recent:
         print(f"  {linha}")
 
     print("\nComandos: [l] Luz ON  [x] Luz OFF  [a] Auto  [b] Voltar  [q] Sair")
 
 
-# ── Loop principal ─────────────────────────────────────────────────────────────
-
 def main() -> None:
-    """Exibe a tela, lê o comando do usuário e age."""
     client = start_mqtt()
     _add_log(f"Iniciando... Broker: {BROKER_HOST}:{BROKER_PORT}")
 
@@ -193,10 +163,16 @@ def main() -> None:
                 with state_lock:
                     vaga_list = sorted(vagas.values(), key=lambda v: v["id_vaga"])
                 idx = int(cmd) - 1
-                if 0 <= idx < len(vaga_list):
+                if not vaga_list:
+                    print("Nenhuma vaga disponível ainda. Aguarde...")
+                    input("Pressione Enter para continuar...")
+                elif 0 <= idx < len(vaga_list):
                     detail_id = vaga_list[idx]["id_vaga"]
                     screen    = "detail"
                     publish_command(client, TOPIC_CMD_VAGA.format(detail_id), "status")
+                else:
+                    print(f"Número inválido. Digite entre 1 e {len(vaga_list)}.")
+                    input("Pressione Enter para continuar...")
 
         elif screen == "detail":
             draw_detail(detail_id)
@@ -216,9 +192,6 @@ def main() -> None:
     client.loop_stop()
     client.disconnect()
     print("Sistema encerrado.")
-
-
-# ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     main()
