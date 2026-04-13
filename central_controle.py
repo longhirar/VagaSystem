@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
 VagaSystem — Central de Controle
-TUI baseada em curses + MQTT (paho).
+MQTT + terminal simples (sem curses).
 
-- Thread principal: desenha a tela e lê o teclado.
-- Thread MQTT (paho): recebe mensagens do broker e chama os callbacks.
+- Thread MQTT (paho): recebe mensagens do broker em background.
+- Thread principal: exibe a tela e lê comandos do usuário.
 """
 
-import curses
 import json
+import os
 import threading
-import time
 import uuid
 from datetime import datetime
 
@@ -22,30 +21,27 @@ BROKER_HOST = "micros-ctba.microsdns.com.br"
 BROKER_PORT = 1883
 CLIENT_ID   = "pc_central_tui_" + uuid.uuid4().hex[:8]
 
-TOPIC_SUB      = "vagasystem/+/status"      # ouve todas as vagas
-TOPIC_CMD_VAGA = "vagasystem/{}/comandos"   # comando para uma vaga
-TOPIC_CMD_ALL  = "vagasystem/all/comandos"  # comando para todas as vagas
+TOPIC_SUB      = "vagasystem/+/status"
+TOPIC_CMD_VAGA = "vagasystem/{}/comandos"
+TOPIC_CMD_ALL  = "vagasystem/all/comandos"
 
-# ── Estado global ──────────────────────────────────────────────────────────────
+# ── Estado global (lido e escrito pelas duas threads) ──────────────────────────
 
-state_lock   = threading.Lock()   # evita leitura e escrita simultânea
-needs_redraw = threading.Event()  # sinaliza que a tela precisa ser redesenhada
+state_lock = threading.Lock()  # evita leitura e escrita ao mesmo tempo
 
-vagas: dict[str, dict] = {}  # { "01": { id_vaga, ocupado, distancia_cm, … } }
+vagas: dict[str, dict] = {}
 log_messages: list[str] = []
 MAX_LOG = 100
-
 mqtt_connected = False
 
 
 def _add_log(msg: str) -> None:
-    """Adiciona uma linha ao log e pede redesenho da tela."""
+    """Adiciona uma mensagem ao log."""
     ts = datetime.now().strftime("%H:%M:%S")
     with state_lock:
         log_messages.append(f"[{ts}] {msg}")
         if len(log_messages) > MAX_LOG:
             log_messages.pop(0)
-    needs_redraw.set()
 
 
 # ── Callbacks MQTT ─────────────────────────────────────────────────────────────
@@ -56,29 +52,25 @@ def on_connect(client, userdata, flags, rc, properties=None):
     if rc == 0:
         mqtt_connected = True
         client.subscribe(TOPIC_SUB)
-        _publish(client, TOPIC_CMD_ALL, "status")
-        _add_log("Conectado ao broker. Broadcast 'status' enviado a todas as vagas.")
+        client.publish(TOPIC_CMD_ALL, json.dumps({"comando": "status"}))
+        _add_log("Conectado ao broker. Solicitando status de todas as vagas...")
     else:
         _add_log(f"Falha na conexão MQTT (rc={rc}).")
-    needs_redraw.set()
 
 
 def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
     """Chamado quando a conexão cai."""
     global mqtt_connected
     mqtt_connected = False
-    _add_log(f"MQTT desconectado (rc={reason_code}). Aguardando reconexão automática...")
-    needs_redraw.set()
+    _add_log(f"MQTT desconectado (rc={reason_code}). Reconectando...")
 
 
 def on_message(client, userdata, msg):
     """Chamado a cada mensagem recebida. Atualiza o dicionário de vagas."""
     try:
         payload = json.loads(msg.payload.decode("utf-8"))
-
         id_vaga = str(payload.get("id_vaga", "")).strip()
         if not id_vaga:
-            _add_log(f"Payload sem 'id_vaga' em {msg.topic}. Ignorado.")
             return
 
         with state_lock:
@@ -92,27 +84,19 @@ def on_message(client, userdata, msg):
             }
 
         estado = "Ocupada" if payload.get("ocupado") else "Livre"
-        _add_log(f"Vaga {id_vaga}: {estado}  |  dist={payload.get('distancia_cm', '?')} cm")
+        _add_log(f"Vaga {id_vaga}: {estado} | dist={payload.get('distancia_cm', '?')} cm")
 
-    except json.JSONDecodeError as e:
-        _add_log(f"JSON inválido ({msg.topic}): {e}")
-    except (TypeError, ValueError) as e:
-        _add_log(f"Payload malformado ({msg.topic}): {e}")
+    except (json.JSONDecodeError, TypeError, ValueError) as e:
+        _add_log(f"Payload inválido ({msg.topic}): {e}")
     except Exception as e:
-        _add_log(f"Erro inesperado on_message: {e}")
+        _add_log(f"Erro inesperado: {e}")
 
 
-# ── Helpers MQTT ───────────────────────────────────────────────────────────────
-
-def _publish(client: mqtt.Client, topic: str, command: str) -> None:
-    """Publica um comando no tópico indicado."""
-    payload = json.dumps({"comando": command})
-    client.publish(topic, payload)
-
+# ── MQTT público ───────────────────────────────────────────────────────────────
 
 def publish_command(client: mqtt.Client, topic: str, command: str) -> None:
-    """Publica um comando e registra no log."""
-    _publish(client, topic, command)
+    """Publica um comando JSON e registra no log."""
+    client.publish(topic, json.dumps({"comando": command}))
     _add_log(f"CMD '{command}' → {topic}")
 
 
@@ -132,375 +116,113 @@ def start_mqtt() -> mqtt.Client:
     return client
 
 
-# ── Constantes de cor ──────────────────────────────────────────────────────────
+# ── Exibição ───────────────────────────────────────────────────────────────────
 
-CP_HEADER   = 1
-CP_OCCUPIED = 2
-CP_FREE     = 3
-CP_SELECTED = 4
-CP_OK       = 5
-CP_ERR      = 6
-CP_LOG      = 7
-CP_BUTTON   = 8
-CP_TITLE    = 9
-CP_DIM      = 10
-
-
-def _init_colors() -> None:
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(CP_HEADER,   curses.COLOR_BLACK,  curses.COLOR_CYAN)
-    curses.init_pair(CP_OCCUPIED, curses.COLOR_WHITE,  curses.COLOR_RED)
-    curses.init_pair(CP_FREE,     curses.COLOR_BLACK,  curses.COLOR_GREEN)
-    curses.init_pair(CP_SELECTED, curses.COLOR_BLACK,  curses.COLOR_YELLOW)
-    curses.init_pair(CP_OK,       curses.COLOR_GREEN,  -1)
-    curses.init_pair(CP_ERR,      curses.COLOR_RED,    -1)
-    curses.init_pair(CP_LOG,      curses.COLOR_CYAN,   -1)
-    curses.init_pair(CP_BUTTON,   curses.COLOR_BLACK,  curses.COLOR_WHITE)
-    curses.init_pair(CP_TITLE,    curses.COLOR_YELLOW, -1)
-    curses.init_pair(CP_DIM,      curses.COLOR_WHITE,  -1)
-
-
-# ── Utilitários de desenho ─────────────────────────────────────────────────────
-
-def _safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
-    """Escreve texto na tela sem estourar os limites da janela."""
-    try:
-        h, w = win.getmaxyx()
-        if 0 <= y < h and 0 <= x < w:
-            win.addstr(y, x, text[: w - x], attr)
-    except curses.error:
-        pass
-
-
-def _draw_hline(win, y: int, char: str = "─") -> None:
-    """Desenha uma linha horizontal."""
-    _, w = win.getmaxyx()
-    _safe_addstr(win, y, 0, char * w)
-
-
-def _draw_header(win, title: str) -> None:
-    """Desenha o cabeçalho com título e status da conexão MQTT."""
-    h, w = win.getmaxyx()
-    conn_str = "● CONECTADO " if mqtt_connected else "○ DESCONECTADO "
-    conn_col = curses.color_pair(CP_OK) | curses.A_BOLD if mqtt_connected \
-               else curses.color_pair(CP_ERR) | curses.A_BOLD
-
-    win.attron(curses.color_pair(CP_HEADER) | curses.A_BOLD)
-    try:
-        win.addstr(0, 0, " " * w)
-        win.addstr(0, max(0, (w - len(title)) // 2), title[:w])
-    except curses.error:
-        pass
-    win.attroff(curses.color_pair(CP_HEADER) | curses.A_BOLD)
-
-    x_conn = w - len(conn_str) - 1
-    if x_conn > 0:
-        win.attron(conn_col)
-        try:
-            win.addstr(0, x_conn, conn_str[: w - x_conn])
-        except curses.error:
-            pass
-        win.attroff(conn_col)
-
-
-def _draw_footer(win, text: str) -> None:
-    """Desenha o rodapé com os atalhos de teclado."""
-    h, w = win.getmaxyx()
-    padded = text.center(w)
-    win.attron(curses.color_pair(CP_HEADER))
-    try:
-        win.addstr(h - 1, 0, padded[:w])
-    except curses.error:
-        pass
-    win.attroff(curses.color_pair(CP_HEADER))
-
-
-def _draw_log_section(win, start_row: int, n_lines: int = 4) -> None:
-    """Desenha as últimas N linhas do log de eventos."""
-    win.attron(curses.color_pair(CP_TITLE) | curses.A_BOLD)
-    _safe_addstr(win, start_row, 2, "LOG DE EVENTOS")
-    win.attroff(curses.color_pair(CP_TITLE) | curses.A_BOLD)
+def draw_dashboard() -> None:
+    """Limpa a tela e exibe a lista de vagas."""
+    os.system("clear")
+    status = "CONECTADO" if mqtt_connected else "DESCONECTADO"
+    print(f"=== VagaSystem — Central de Controle  [{status}] ===\n")
 
     with state_lock:
-        recent = log_messages[-n_lines:]
-
-    for i, line in enumerate(recent):
-        win.attron(curses.color_pair(CP_LOG))
-        _safe_addstr(win, start_row + 1 + i, 4, line)
-        win.attroff(curses.color_pair(CP_LOG))
-
-
-def _draw_button(win, y: int, x: int, label: str) -> int:
-    """Desenha um botão e retorna a posição x após ele."""
-    btn = f"  {label}  "
-    win.attron(curses.color_pair(CP_BUTTON) | curses.A_BOLD)
-    _safe_addstr(win, y, x, btn)
-    win.attroff(curses.color_pair(CP_BUTTON) | curses.A_BOLD)
-    return x + len(btn) + 2
-
-
-# ── Tela 1 — Dashboard ────────────────────────────────────────────────────────
-
-def draw_dashboard(stdscr, selected_idx: int) -> None:
-    """Desenha a lista de todas as vagas do estacionamento."""
-    stdscr.erase()
-    h, w = stdscr.getmaxyx()
-
-    _draw_header(stdscr, "  VagaSystem — Central de Controle  ")
-
-    stdscr.attron(curses.color_pair(CP_TITLE) | curses.A_BOLD)
-    _safe_addstr(stdscr, 2, 2, "VAGAS DO ESTACIONAMENTO")
-    stdscr.attroff(curses.color_pair(CP_TITLE) | curses.A_BOLD)
-
-    hdr = f"{'ID DA VAGA':<10}  {'ESTADO':<14}  {'ATUALIZADO':<10}"
-    stdscr.attron(curses.A_BOLD | curses.A_UNDERLINE)
-    _safe_addstr(stdscr, 3, 2, hdr)
-    stdscr.attroff(curses.A_BOLD | curses.A_UNDERLINE)
-
-    max_rows = h - 14
-    row = 4
-
-    with state_lock:
-        vaga_list = sorted(vagas.values(), key=lambda v: v["id_vaga"])
+        vaga_list  = sorted(vagas.values(), key=lambda v: v["id_vaga"])
+        log_recent = log_messages[-5:]
 
     if not vaga_list:
-        stdscr.attron(curses.color_pair(CP_DIM))
-        _safe_addstr(stdscr, row, 4, "Aguardando dados das vagas...")
-        stdscr.attroff(curses.color_pair(CP_DIM))
-        row += 1
+        print("  Aguardando dados das vagas...\n")
     else:
-        for idx, vaga in enumerate(vaga_list[:max_rows]):
-            ocupado    = vaga["ocupado"]
-            estado_str = "  OCUPADA" if ocupado else "  LIVRE  "
-            linha = (
-                f" {vaga['id_vaga']:<10}"
-                f"  {estado_str:<14}"
-                f"  {vaga['last_update']:<10}"
-            )
+        print(f"  {'Nº':<4}  {'ID':<8}  {'ESTADO':<10}  ATUALIZADO")
+        print(f"  {'─'*4}  {'─'*8}  {'─'*10}  {'─'*8}")
+        for i, vaga in enumerate(vaga_list, start=1):
+            estado = "OCUPADA" if vaga["ocupado"] else "LIVRE"
+            print(f"  {i:<4}  {vaga['id_vaga']:<8}  {estado:<10}  {vaga['last_update']}")
 
-            if idx == selected_idx:
-                attr = curses.color_pair(CP_SELECTED) | curses.A_BOLD
-            elif ocupado:
-                attr = curses.color_pair(CP_OCCUPIED)
-            else:
-                attr = curses.color_pair(CP_FREE)
+    print("\n--- LOG (últimas mensagens) ---")
+    for linha in log_recent:
+        print(f"  {linha}")
 
-            stdscr.attron(attr)
-            try:
-                stdscr.addstr(row, 0, linha.ljust(w - 1)[: w - 1])
-            except curses.error:
-                pass
-            stdscr.attroff(attr)
-            row += 1
-
-    sep_row = h - 10
-    _draw_hline(stdscr, sep_row)
-
-    maint_row = sep_row + 1
-    stdscr.attron(curses.color_pair(CP_TITLE) | curses.A_BOLD)
-    _safe_addstr(stdscr, maint_row, 2, "MODO MANUTENÇÃO GLOBAL  (envia para todas as vagas)")
-    stdscr.attroff(curses.color_pair(CP_TITLE) | curses.A_BOLD)
-
-    btn_row = maint_row + 1
-    x = 2
-    x = _draw_button(stdscr, btn_row, x, "[L] Luz ON")
-    x = _draw_button(stdscr, btn_row, x, "[X] Luz OFF")
-    x = _draw_button(stdscr, btn_row, x, "[A] Modo Auto")
-
-    _draw_log_section(stdscr, btn_row + 2, n_lines=4)
-
-    _draw_footer(
-        stdscr,
-        " [↑↓] Navegar  [Enter] Ver Detalhes  [L] Luz ON  [X] Luz OFF  [A] Auto  [Q] Sair ",
-    )
-
-    stdscr.refresh()
+    print("\nComandos: [número] Ver detalhes  [l] Luz ON  [x] Luz OFF  [a] Auto  [q] Sair")
 
 
-# ── Tela 2 — Detalhes de uma vaga ─────────────────────────────────────────────
-
-def draw_detail(stdscr, id_vaga: str) -> None:
-    """Desenha os dados completos de uma vaga específica."""
-    stdscr.erase()
-    h, w = stdscr.getmaxyx()
-
-    _draw_header(stdscr, f"  VagaSystem — Detalhes: Vaga {id_vaga}  ")
+def draw_detail(id_vaga: str) -> None:
+    """Limpa a tela e exibe os detalhes de uma vaga específica."""
+    os.system("clear")
+    print(f"=== VagaSystem — Detalhes: Vaga {id_vaga} ===\n")
 
     with state_lock:
-        vaga = vagas.get(id_vaga)
-
-    row = 2
-
-    stdscr.attron(curses.color_pair(CP_TITLE) | curses.A_BOLD)
-    _safe_addstr(stdscr, row, 2, f"INFORMAÇÕES DA VAGA {id_vaga}")
-    stdscr.attroff(curses.color_pair(CP_TITLE) | curses.A_BOLD)
-    row += 2
+        vaga       = vagas.get(id_vaga)
+        log_recent = log_messages[-5:]
 
     if vaga is None:
-        stdscr.attron(curses.color_pair(CP_DIM))
-        _safe_addstr(stdscr, row, 4, f"Aguardando resposta da vaga {id_vaga}...")
-        stdscr.attroff(curses.color_pair(CP_DIM))
-        row += 1
+        print(f"  Aguardando dados da vaga {id_vaga}...\n")
     else:
-        ocupado    = vaga["ocupado"]
-        badge      = "  ●  VAGA OCUPADA  " if ocupado else "  ○  VAGA LIVRE   "
-        badge_attr = curses.color_pair(CP_OCCUPIED) | curses.A_BOLD if ocupado \
-                     else curses.color_pair(CP_FREE) | curses.A_BOLD
-        stdscr.attron(badge_attr)
-        _safe_addstr(stdscr, row, 4, badge)
-        stdscr.attroff(badge_attr)
-        row += 2
+        estado = "OCUPADA" if vaga["ocupado"] else "LIVRE"
+        print(f"  Estado:              {estado}")
+        print(f"  Distância:           {vaga['distancia_cm']:.1f} cm")
+        print(f"  Luz ambiente (LDR):  {vaga['luz_ambiente']} / 4095")
+        print(f"  Brilho LED (PWM):    {vaga['brilho_led']} / 1023")
+        print(f"  Última atualização:  {vaga['last_update']}")
 
-        barra_ldr = _bar(vaga["luz_ambiente"], 4095, 20)
-        barra_pwm = _bar(vaga["brilho_led"],   1023, 20)
+    print("\n--- LOG (últimas mensagens) ---")
+    for linha in log_recent:
+        print(f"  {linha}")
 
-        fields = [
-            ("Distância (ultrassônico)",  f"{vaga['distancia_cm']:.1f} cm"),
-            ("Nível LDR (luz ambiente) ", f"{vaga['luz_ambiente']:>4} / 4095  {barra_ldr}"),
-            ("Brilho LED (PWM)         ", f"{vaga['brilho_led']:>4} / 1023  {barra_pwm}"),
-            ("Última atualização       ", vaga["last_update"]),
-        ]
-
-        label_w = 26
-        for label, value in fields:
-            stdscr.attron(curses.A_BOLD)
-            _safe_addstr(stdscr, row, 4, f"{label}:")
-            stdscr.attroff(curses.A_BOLD)
-            stdscr.attron(curses.color_pair(CP_DIM))
-            _safe_addstr(stdscr, row, 4 + label_w + 2, value)
-            stdscr.attroff(curses.color_pair(CP_DIM))
-            row += 1
-
-    sep_row = h - 9
-    _draw_hline(stdscr, sep_row)
-
-    ctrl_row = sep_row + 1
-    stdscr.attron(curses.color_pair(CP_TITLE) | curses.A_BOLD)
-    _safe_addstr(stdscr, ctrl_row, 2, f"CONTROLE DA VAGA {id_vaga}")
-    stdscr.attroff(curses.color_pair(CP_TITLE) | curses.A_BOLD)
-
-    btn_row = ctrl_row + 1
-    x = 2
-    x = _draw_button(stdscr, btn_row, x, "[L] Forçar Luz ON")
-    x = _draw_button(stdscr, btn_row, x, "[X] Forçar Luz OFF")
-    x = _draw_button(stdscr, btn_row, x, "[A] Modo Automático")
-    x = _draw_button(stdscr, btn_row, x, "[B] Voltar")
-
-    _draw_log_section(stdscr, btn_row + 2, n_lines=3)
-
-    _draw_footer(
-        stdscr,
-        " [L] Luz ON  [X] Luz OFF  [A] Auto  [B / Esc] Voltar ao Dashboard  [Q] Sair ",
-    )
-
-    stdscr.refresh()
-
-
-def _bar(value: int, max_value: int, width: int = 20) -> str:
-    """Barra de progresso ASCII. Ex: [████████░░░░░░░░░░░░]"""
-    filled = int((value / max_value) * width) if max_value > 0 else 0
-    filled = max(0, min(filled, width))
-    return "[" + "█" * filled + "░" * (width - filled) + "]"
+    print("\nComandos: [l] Luz ON  [x] Luz OFF  [a] Auto  [b] Voltar  [q] Sair")
 
 
 # ── Loop principal ─────────────────────────────────────────────────────────────
 
-def main(stdscr) -> None:
-    """Loop da TUI: redesenha a tela e responde ao teclado."""
-    curses.curs_set(0)
-    stdscr.nodelay(True)
-    stdscr.keypad(True)
-    _init_colors()
-
+def main() -> None:
+    """Exibe a tela, lê o comando do usuário e age."""
     client = start_mqtt()
-    _add_log(f"Iniciando... Client ID: {CLIENT_ID}")
-    _add_log(f"Broker: {BROKER_HOST}:{BROKER_PORT}")
+    _add_log(f"Iniciando... Broker: {BROKER_HOST}:{BROKER_PORT}")
 
-    screen       = "dashboard"  # "dashboard" ou "detail"
-    selected_idx = 0
-    detail_id    = None
+    screen    = "dashboard"
+    detail_id = None
 
-    last_draw   = 0.0
-    REFRESH_SEC = 1.0  # redesenho mínimo a cada 1 segundo
+    while True:
+        if screen == "dashboard":
+            draw_dashboard()
+            cmd = input("\n> ").strip().lower()
 
-    try:
-        while True:
-            now = time.monotonic()
-
-            # Redesenha quando há novidade MQTT ou passou REFRESH_SEC
-            if needs_redraw.is_set() or (now - last_draw) >= REFRESH_SEC:
-                needs_redraw.clear()
-                last_draw = now
-
-                with state_lock:
-                    n = len(vagas)
-                if n > 0:
-                    selected_idx = min(selected_idx, n - 1)
-
-                if screen == "dashboard":
-                    draw_dashboard(stdscr, selected_idx)
-                else:
-                    draw_detail(stdscr, detail_id)
-
-            key = stdscr.getch()
-
-            if key == curses.ERR:
-                time.sleep(0.04)
-                continue
-
-            if key in (ord("q"), ord("Q")):
+            if cmd == "q":
                 break
-
-            if screen == "dashboard":
+            elif cmd == "l":
+                publish_command(client, TOPIC_CMD_ALL, "luz_on")
+            elif cmd == "x":
+                publish_command(client, TOPIC_CMD_ALL, "luz_off")
+            elif cmd == "a":
+                publish_command(client, TOPIC_CMD_ALL, "auto")
+            elif cmd.isdigit():
                 with state_lock:
                     vaga_list = sorted(vagas.values(), key=lambda v: v["id_vaga"])
-                n = len(vaga_list)
+                idx = int(cmd) - 1
+                if 0 <= idx < len(vaga_list):
+                    detail_id = vaga_list[idx]["id_vaga"]
+                    screen    = "detail"
+                    publish_command(client, TOPIC_CMD_VAGA.format(detail_id), "status")
 
-                if key == curses.KEY_UP:
-                    selected_idx = max(0, selected_idx - 1)
-                    needs_redraw.set()
+        elif screen == "detail":
+            draw_detail(detail_id)
+            cmd = input("\n> ").strip().lower()
 
-                elif key == curses.KEY_DOWN:
-                    selected_idx = min(max(0, n - 1), selected_idx + 1)
-                    needs_redraw.set()
+            if cmd == "q":
+                break
+            elif cmd in ("b", ""):
+                screen = "dashboard"
+            elif cmd == "l":
+                publish_command(client, TOPIC_CMD_VAGA.format(detail_id), "luz_on")
+            elif cmd == "x":
+                publish_command(client, TOPIC_CMD_VAGA.format(detail_id), "luz_off")
+            elif cmd == "a":
+                publish_command(client, TOPIC_CMD_VAGA.format(detail_id), "auto")
 
-                elif key in (curses.KEY_ENTER, ord("\n"), ord("\r")):
-                    if n > 0:
-                        detail_id = vaga_list[selected_idx]["id_vaga"]
-                        screen = "detail"
-                        publish_command(client, TOPIC_CMD_VAGA.format(detail_id), "status")
-                        needs_redraw.set()
-
-                elif key in (ord("l"), ord("L")):
-                    publish_command(client, TOPIC_CMD_ALL, "luz_on")
-
-                elif key in (ord("x"), ord("X")):
-                    publish_command(client, TOPIC_CMD_ALL, "luz_off")
-
-                elif key in (ord("a"), ord("A")):
-                    publish_command(client, TOPIC_CMD_ALL, "auto")
-
-            elif screen == "detail":
-                if key in (ord("b"), ord("B"), 27):  # 27 = Esc
-                    screen = "dashboard"
-                    needs_redraw.set()
-
-                elif key in (ord("l"), ord("L")):
-                    publish_command(client, TOPIC_CMD_VAGA.format(detail_id), "luz_on")
-
-                elif key in (ord("x"), ord("X")):
-                    publish_command(client, TOPIC_CMD_VAGA.format(detail_id), "luz_off")
-
-                elif key in (ord("a"), ord("A")):
-                    publish_command(client, TOPIC_CMD_VAGA.format(detail_id), "auto")
-
-    finally:
-        client.loop_stop()
-        client.disconnect()
+    client.loop_stop()
+    client.disconnect()
+    print("Sistema encerrado.")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    curses.wrapper(main)
+    main()
