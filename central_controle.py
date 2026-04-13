@@ -91,11 +91,11 @@ def on_connect(client, userdata, flags, rc, properties=None):
     needs_redraw.set()
 
 
-def on_disconnect(client, userdata, rc, properties=None):
+def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
     """Disparado quando a conexão cai. Atualiza flag e agenda redesenho."""
     global mqtt_connected
     mqtt_connected = False
-    _add_log(f"MQTT desconectado (rc={rc}). Aguardando reconexão automática...")
+    _add_log(f"MQTT desconectado (rc={reason_code}). Aguardando reconexão automática...")
     needs_redraw.set()
 
 
