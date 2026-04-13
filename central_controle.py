@@ -102,16 +102,12 @@ def publish_command(client: mqtt.Client, topic: str, command: str) -> None:
 
 def start_mqtt() -> mqtt.Client:
     """Cria o cliente MQTT e inicia a thread de rede em background."""
-    client = mqtt.Client(
-        client_id=CLIENT_ID,
-        protocol=mqtt.MQTTv5,
-        callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
-    )
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=CLIENT_ID)
     client.on_connect    = on_connect
     client.on_disconnect = on_disconnect
     client.on_message    = on_message
     client.reconnect_delay_set(min_delay=2, max_delay=30)
-    client.connect_async(BROKER_HOST, BROKER_PORT, keepalive=60)
+    client.connect(BROKER_HOST, BROKER_PORT, 60)
     client.loop_start()
     return client
 
