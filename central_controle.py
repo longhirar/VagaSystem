@@ -1,18 +1,10 @@
 #!/usr/bin/env python3
 """
 VagaSystem — Central de Controle
-═══════════════════════════════════════════════════════════════════════════════
-TUI baseada em curses  +  MQTT assíncrono via paho (loop_start).
+TUI baseada em curses + MQTT (paho).
 
-Arquitetura de threads:
-  • Thread principal  → curses: desenha tela, processa teclado.
-  • Thread MQTT       → paho loop_start(): escuta broker, dispara callbacks.
-
-Os callbacks do MQTT (on_connect, on_message) rodam na thread do paho.
-Eles atualizam o dicionário 'vagas' e a lista 'log_messages' sob o
-'state_lock' (threading.Lock) para evitar race conditions, e sinalizam
-'needs_redraw' (threading.Event) para que a thread principal redesenhe
-a tela na próxima iteração do seu loop principal, sem bloquear.
+- Thread principal: desenha a tela e lê o teclado.
+- Thread MQTT (paho): recebe mensagens do broker e chama os callbacks.
 """
 
 import curses
@@ -24,43 +16,30 @@ from datetime import datetime
 
 import paho.mqtt.client as mqtt
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  CONFIGURAÇÕES MQTT
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Configurações MQTT ─────────────────────────────────────────────────────────
 
 BROKER_HOST = "micros-ctba.microsdns.com.br"
 BROKER_PORT = 1883
-# Client ID único por sessão para evitar conflito de sessão no broker
-CLIENT_ID = "pc_central_tui_" + uuid.uuid4().hex[:8]
+CLIENT_ID   = "pc_central_tui_" + uuid.uuid4().hex[:8]
 
-TOPIC_SUB      = "vagasystem/+/status"           # wildcard: escuta todas as vagas
-TOPIC_CMD_VAGA = "vagasystem/{}/comandos"         # comando para vaga específica
-TOPIC_CMD_ALL  = "vagasystem/all/comandos"        # broadcast para todas as vagas
+TOPIC_SUB      = "vagasystem/+/status"      # ouve todas as vagas
+TOPIC_CMD_VAGA = "vagasystem/{}/comandos"   # comando para uma vaga
+TOPIC_CMD_ALL  = "vagasystem/all/comandos"  # comando para todas as vagas
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  ESTADO GLOBAL COMPARTILHADO (lido/escrito por ambas as threads)
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Estado global ──────────────────────────────────────────────────────────────
 
-state_lock    = threading.Lock()     # protege 'vagas' e 'log_messages'
-needs_redraw  = threading.Event()    # sinaliza: thread MQTT → thread curses
+state_lock   = threading.Lock()   # evita leitura e escrita simultânea
+needs_redraw = threading.Event()  # sinaliza que a tela precisa ser redesenhada
 
-# Dicionário principal: { "01": { id_vaga, ocupado, distancia_cm, … }, … }
-vagas: dict[str, dict] = {}
-
-# Log circular de eventos para exibição na TUI
+vagas: dict[str, dict] = {}  # { "01": { id_vaga, ocupado, distancia_cm, … } }
 log_messages: list[str] = []
 MAX_LOG = 100
 
-# Estado da conexão MQTT (atualizado pelo callback on_connect/on_disconnect)
 mqtt_connected = False
 
 
 def _add_log(msg: str) -> None:
-    """
-    Registra uma linha no log e sinaliza redesenho.
-    Chamado tanto pela thread MQTT quanto pela thread principal.
-    Usa state_lock para acesso seguro à lista log_messages.
-    """
+    """Adiciona uma linha ao log e pede redesenho da tela."""
     ts = datetime.now().strftime("%H:%M:%S")
     with state_lock:
         log_messages.append(f"[{ts}] {msg}")
@@ -69,21 +48,14 @@ def _add_log(msg: str) -> None:
     needs_redraw.set()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  CALLBACKS MQTT  (executados na thread interna do paho, não na thread curses)
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Callbacks MQTT ─────────────────────────────────────────────────────────────
 
 def on_connect(client, userdata, flags, rc, properties=None):
-    """
-    Disparado pela thread paho quando a conexão ao broker é estabelecida.
-    Após conectar: subscribe no wildcard e faz broadcast de 'status' para
-    forçar todas as vagas já ligadas a se apresentarem imediatamente.
-    """
+    """Chamado quando o cliente conecta ao broker."""
     global mqtt_connected
     if rc == 0:
         mqtt_connected = True
         client.subscribe(TOPIC_SUB)
-        # Boot do sistema: solicita estado atual de todas as vagas
         _publish(client, TOPIC_CMD_ALL, "status")
         _add_log("Conectado ao broker. Broadcast 'status' enviado a todas as vagas.")
     else:
@@ -92,7 +64,7 @@ def on_connect(client, userdata, flags, rc, properties=None):
 
 
 def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
-    """Disparado quando a conexão cai. Atualiza flag e agenda redesenho."""
+    """Chamado quando a conexão cai."""
     global mqtt_connected
     mqtt_connected = False
     _add_log(f"MQTT desconectado (rc={reason_code}). Aguardando reconexão automática...")
@@ -100,17 +72,7 @@ def on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
 
 
 def on_message(client, userdata, msg):
-    """
-    Disparado pela thread paho a cada mensagem recebida em 'vagasystem/+/status'.
-
-    Fluxo:
-      1. Decodifica e valida o JSON recebido.
-      2. Atualiza o dict 'vagas' sob state_lock (seguro entre threads).
-      3. Chama needs_redraw.set() → thread curses redesenha na próxima iteração.
-
-    Tratamento de erros: JSON mal-formado ou payload incompleto são logados
-    e descartados silenciosamente — a TUI jamais trava por causa disso.
-    """
+    """Chamado a cada mensagem recebida. Atualiza o dicionário de vagas."""
     try:
         payload = json.loads(msg.payload.decode("utf-8"))
 
@@ -140,28 +102,22 @@ def on_message(client, userdata, msg):
         _add_log(f"Erro inesperado on_message: {e}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  HELPERS MQTT
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Helpers MQTT ───────────────────────────────────────────────────────────────
 
 def _publish(client: mqtt.Client, topic: str, command: str) -> None:
-    """Envelopa o comando em JSON e publica. Thread-safe (paho é thread-safe)."""
+    """Publica um comando no tópico indicado."""
     payload = json.dumps({"comando": command})
     client.publish(topic, payload)
 
 
 def publish_command(client: mqtt.Client, topic: str, command: str) -> None:
-    """Versão pública: publica e registra no log."""
+    """Publica um comando e registra no log."""
     _publish(client, topic, command)
     _add_log(f"CMD '{command}' → {topic}")
 
 
 def start_mqtt() -> mqtt.Client:
-    """
-    Cria e configura o cliente MQTT.
-    loop_start() inicia uma thread daemon separada que gerencia todo o I/O
-    de rede (reconexões, keep-alive, callbacks) sem bloquear a thread curses.
-    """
+    """Cria o cliente MQTT e inicia a thread de rede em background."""
     client = mqtt.Client(
         client_id=CLIENT_ID,
         protocol=mqtt.MQTTv5,
@@ -172,29 +128,27 @@ def start_mqtt() -> mqtt.Client:
     client.on_message    = on_message
     client.reconnect_delay_set(min_delay=2, max_delay=30)
     client.connect_async(BROKER_HOST, BROKER_PORT, keepalive=60)
-    client.loop_start()   # ← thread secundária não-bloqueante
+    client.loop_start()
     return client
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  CONSTANTES DE COR (índices dos pares de cor do curses)
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Constantes de cor ──────────────────────────────────────────────────────────
 
-CP_HEADER    = 1   # fundo ciano, texto preto  — cabeçalho / rodapé
-CP_OCCUPIED  = 2   # fundo vermelho, texto branco
-CP_FREE      = 3   # fundo verde, texto preto
-CP_SELECTED  = 4   # fundo amarelo, texto preto  — linha selecionada
-CP_OK        = 5   # verde   — status MQTT ok
-CP_ERR       = 6   # vermelho — status MQTT erro
-CP_LOG       = 7   # ciano   — linhas de log
-CP_BUTTON    = 8   # fundo branco, texto preto  — botões
-CP_TITLE     = 9   # amarelo — subtítulos de seção
-CP_DIM       = 10  # cinza   — textos secundários
+CP_HEADER   = 1
+CP_OCCUPIED = 2
+CP_FREE     = 3
+CP_SELECTED = 4
+CP_OK       = 5
+CP_ERR      = 6
+CP_LOG      = 7
+CP_BUTTON   = 8
+CP_TITLE    = 9
+CP_DIM      = 10
 
 
 def _init_colors() -> None:
     curses.start_color()
-    curses.use_default_colors()   # -1 = cor padrão do terminal
+    curses.use_default_colors()
     curses.init_pair(CP_HEADER,   curses.COLOR_BLACK,  curses.COLOR_CYAN)
     curses.init_pair(CP_OCCUPIED, curses.COLOR_WHITE,  curses.COLOR_RED)
     curses.init_pair(CP_FREE,     curses.COLOR_BLACK,  curses.COLOR_GREEN)
@@ -207,12 +161,10 @@ def _init_colors() -> None:
     curses.init_pair(CP_DIM,      curses.COLOR_WHITE,  -1)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  UTILITÁRIOS DE DESENHO
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Utilitários de desenho ─────────────────────────────────────────────────────
 
 def _safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
-    """addstr sem estourar os limites da janela (curses.error ignorado)."""
+    """Escreve texto na tela sem estourar os limites da janela."""
     try:
         h, w = win.getmaxyx()
         if 0 <= y < h and 0 <= x < w:
@@ -222,28 +174,26 @@ def _safe_addstr(win, y: int, x: int, text: str, attr: int = 0) -> None:
 
 
 def _draw_hline(win, y: int, char: str = "─") -> None:
-    """Linha horizontal simples."""
+    """Desenha uma linha horizontal."""
     _, w = win.getmaxyx()
     _safe_addstr(win, y, 0, char * w)
 
 
 def _draw_header(win, title: str) -> None:
-    """Faixa de cabeçalho colorida com título centralizado e status MQTT."""
+    """Desenha o cabeçalho com título e status da conexão MQTT."""
     h, w = win.getmaxyx()
     conn_str = "● CONECTADO " if mqtt_connected else "○ DESCONECTADO "
     conn_col = curses.color_pair(CP_OK) | curses.A_BOLD if mqtt_connected \
                else curses.color_pair(CP_ERR) | curses.A_BOLD
 
-    # Fundo ciano na linha 0
     win.attron(curses.color_pair(CP_HEADER) | curses.A_BOLD)
     try:
         win.addstr(0, 0, " " * w)
-        win.addstr(0, max(0, (w - len(title)) // 2), title[: w])
+        win.addstr(0, max(0, (w - len(title)) // 2), title[:w])
     except curses.error:
         pass
     win.attroff(curses.color_pair(CP_HEADER) | curses.A_BOLD)
 
-    # Status MQTT sobreposto à direita
     x_conn = w - len(conn_str) - 1
     if x_conn > 0:
         win.attron(conn_col)
@@ -255,12 +205,12 @@ def _draw_header(win, title: str) -> None:
 
 
 def _draw_footer(win, text: str) -> None:
-    """Faixa de rodapé colorida com atalhos."""
+    """Desenha o rodapé com os atalhos de teclado."""
     h, w = win.getmaxyx()
     padded = text.center(w)
     win.attron(curses.color_pair(CP_HEADER))
     try:
-        win.addstr(h - 1, 0, padded[: w])
+        win.addstr(h - 1, 0, padded[:w])
     except curses.error:
         pass
     win.attroff(curses.color_pair(CP_HEADER))
@@ -268,7 +218,6 @@ def _draw_footer(win, text: str) -> None:
 
 def _draw_log_section(win, start_row: int, n_lines: int = 4) -> None:
     """Desenha as últimas N linhas do log de eventos."""
-    h, w = win.getmaxyx()
     win.attron(curses.color_pair(CP_TITLE) | curses.A_BOLD)
     _safe_addstr(win, start_row, 2, "LOG DE EVENTOS")
     win.attroff(curses.color_pair(CP_TITLE) | curses.A_BOLD)
@@ -291,46 +240,24 @@ def _draw_button(win, y: int, x: int, label: str) -> int:
     return x + len(btn) + 2
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  TELA 1 — DASHBOARD PRINCIPAL
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Tela 1 — Dashboard ────────────────────────────────────────────────────────
 
 def draw_dashboard(stdscr, selected_idx: int) -> None:
-    """
-    Renderiza a visão geral do estacionamento.
-
-    Estrutura (de cima para baixo):
-      Linha 0   : cabeçalho + status MQTT
-      Linha 2   : título "VAGAS DO ESTACIONAMENTO"
-      Linha 3   : cabeçalho da tabela
-      Linhas 4+ : uma linha por vaga (scroll implícito por limite de altura)
-      …         : separador horizontal
-      …         : seção "Modo Manutenção Global" com botões
-      …         : log de eventos
-      Última    : rodapé com atalhos
-    """
+    """Desenha a lista de todas as vagas do estacionamento."""
     stdscr.erase()
     h, w = stdscr.getmaxyx()
 
     _draw_header(stdscr, "  VagaSystem — Central de Controle  ")
 
-    # ── Título da seção ──────────────────────────────────────────────────────
     stdscr.attron(curses.color_pair(CP_TITLE) | curses.A_BOLD)
     _safe_addstr(stdscr, 2, 2, "VAGAS DO ESTACIONAMENTO")
     stdscr.attroff(curses.color_pair(CP_TITLE) | curses.A_BOLD)
 
-    # ── Cabeçalho da tabela ──────────────────────────────────────────────────
-    col_id     = 2
-    col_estado = 14
-    col_update = 32
     hdr = f"{'ID DA VAGA':<10}  {'ESTADO':<14}  {'ATUALIZADO':<10}"
     stdscr.attron(curses.A_BOLD | curses.A_UNDERLINE)
-    _safe_addstr(stdscr, 3, col_id, hdr)
+    _safe_addstr(stdscr, 3, 2, hdr)
     stdscr.attroff(curses.A_BOLD | curses.A_UNDERLINE)
 
-    # ── Linhas de vagas ──────────────────────────────────────────────────────
-    # Reserva linhas no final para: separador(1) + título cmd(1) + botões(1)
-    # + espaço(1) + título log(1) + log(4) + rodapé(1) = 10 linhas reservadas
     max_rows = h - 14
     row = 4
 
@@ -367,11 +294,9 @@ def draw_dashboard(stdscr, selected_idx: int) -> None:
             stdscr.attroff(attr)
             row += 1
 
-    # ── Separador ────────────────────────────────────────────────────────────
     sep_row = h - 10
     _draw_hline(stdscr, sep_row)
 
-    # ── Modo Manutenção Global ────────────────────────────────────────────────
     maint_row = sep_row + 1
     stdscr.attron(curses.color_pair(CP_TITLE) | curses.A_BOLD)
     _safe_addstr(stdscr, maint_row, 2, "MODO MANUTENÇÃO GLOBAL  (envia para todas as vagas)")
@@ -383,34 +308,20 @@ def draw_dashboard(stdscr, selected_idx: int) -> None:
     x = _draw_button(stdscr, btn_row, x, "[X] Luz OFF")
     x = _draw_button(stdscr, btn_row, x, "[A] Modo Auto")
 
-    # ── Log de eventos ───────────────────────────────────────────────────────
     _draw_log_section(stdscr, btn_row + 2, n_lines=4)
 
-    # ── Rodapé ───────────────────────────────────────────────────────────────
     _draw_footer(
         stdscr,
-        " [↑↓] Navegar  [Enter] Ver Detalhes  [L] Luz ON  [X] Luz OFF  [A] Auto  [Q] Sair "
+        " [↑↓] Navegar  [Enter] Ver Detalhes  [L] Luz ON  [X] Luz OFF  [A] Auto  [Q] Sair ",
     )
 
     stdscr.refresh()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  TELA 2 — DETALHES DE UMA VAGA
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Tela 2 — Detalhes de uma vaga ─────────────────────────────────────────────
 
 def draw_detail(stdscr, id_vaga: str) -> None:
-    """
-    Renderiza os dados completos de uma vaga específica.
-
-    Reatividade: como needs_redraw é setado pelo on_message sempre que um
-    novo payload chega, esta função é chamada novamente pelo loop principal
-    automaticamente, mantendo os dados sempre atuais sem intervenção do usuário.
-
-    Nota: o comando 'status' já foi enviado no momento em que o usuário
-    selecionou esta tela (veja o loop principal). Não há botão "Atualizar"
-    nem nenhuma menção ao comando 'status' aqui — conforme especificação.
-    """
+    """Desenha os dados completos de uma vaga específica."""
     stdscr.erase()
     h, w = stdscr.getmaxyx()
 
@@ -421,22 +332,19 @@ def draw_detail(stdscr, id_vaga: str) -> None:
 
     row = 2
 
-    # ── Título da seção ──────────────────────────────────────────────────────
     stdscr.attron(curses.color_pair(CP_TITLE) | curses.A_BOLD)
     _safe_addstr(stdscr, row, 2, f"INFORMAÇÕES DA VAGA {id_vaga}")
     stdscr.attroff(curses.color_pair(CP_TITLE) | curses.A_BOLD)
     row += 2
 
     if vaga is None:
-        # Vaga ainda não enviou dados (aguarda resposta do comando 'status')
         stdscr.attron(curses.color_pair(CP_DIM))
         _safe_addstr(stdscr, row, 4, f"Aguardando resposta da vaga {id_vaga}...")
         stdscr.attroff(curses.color_pair(CP_DIM))
         row += 1
     else:
-        # ── Badge de ocupação ────────────────────────────────────────────────
-        ocupado = vaga["ocupado"]
-        badge   = "  ●  VAGA OCUPADA  " if ocupado else "  ○  VAGA LIVRE   "
+        ocupado    = vaga["ocupado"]
+        badge      = "  ●  VAGA OCUPADA  " if ocupado else "  ○  VAGA LIVRE   "
         badge_attr = curses.color_pair(CP_OCCUPIED) | curses.A_BOLD if ocupado \
                      else curses.color_pair(CP_FREE) | curses.A_BOLD
         stdscr.attron(badge_attr)
@@ -444,7 +352,6 @@ def draw_detail(stdscr, id_vaga: str) -> None:
         stdscr.attroff(badge_attr)
         row += 2
 
-        # ── Tabela de dados do sensor ────────────────────────────────────────
         barra_ldr = _bar(vaga["luz_ambiente"], 4095, 20)
         barra_pwm = _bar(vaga["brilho_led"],   1023, 20)
 
@@ -465,11 +372,9 @@ def draw_detail(stdscr, id_vaga: str) -> None:
             stdscr.attroff(curses.color_pair(CP_DIM))
             row += 1
 
-    # ── Separador ────────────────────────────────────────────────────────────
     sep_row = h - 9
     _draw_hline(stdscr, sep_row)
 
-    # ── Botões de controle ───────────────────────────────────────────────────
     ctrl_row = sep_row + 1
     stdscr.attron(curses.color_pair(CP_TITLE) | curses.A_BOLD)
     _safe_addstr(stdscr, ctrl_row, 2, f"CONTROLE DA VAGA {id_vaga}")
@@ -482,73 +387,52 @@ def draw_detail(stdscr, id_vaga: str) -> None:
     x = _draw_button(stdscr, btn_row, x, "[A] Modo Automático")
     x = _draw_button(stdscr, btn_row, x, "[B] Voltar")
 
-    # ── Log de eventos ───────────────────────────────────────────────────────
     _draw_log_section(stdscr, btn_row + 2, n_lines=3)
 
-    # ── Rodapé ───────────────────────────────────────────────────────────────
     _draw_footer(
         stdscr,
-        " [L] Luz ON  [X] Luz OFF  [A] Auto  [B / Esc] Voltar ao Dashboard  [Q] Sair "
+        " [L] Luz ON  [X] Luz OFF  [A] Auto  [B / Esc] Voltar ao Dashboard  [Q] Sair ",
     )
 
     stdscr.refresh()
 
 
 def _bar(value: int, max_value: int, width: int = 20) -> str:
-    """Barra de progresso ASCII simples. Ex: [████████░░░░░░░░░░░░]"""
-    if max_value == 0:
-        filled = 0
-    else:
-        filled = int((value / max_value) * width)
+    """Barra de progresso ASCII. Ex: [████████░░░░░░░░░░░░]"""
+    filled = int((value / max_value) * width) if max_value > 0 else 0
     filled = max(0, min(filled, width))
     return "[" + "█" * filled + "░" * (width - filled) + "]"
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  LOOP PRINCIPAL (thread curses / thread principal)
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Loop principal ─────────────────────────────────────────────────────────────
 
 def main(stdscr) -> None:
-    """
-    Ponto de entrada da TUI. Gerencia o ciclo:
-      1. Verificar se needs_redraw foi setado (pela thread MQTT ou por input).
-      2. Redesenhar a tela correta se necessário.
-      3. Ler tecla (não-bloqueante via nodelay).
-      4. Processar tecla → mudar estado → setar needs_redraw → volta ao passo 1.
-
-    A conexão MQTT roda em paralelo na thread do paho (loop_start).
-    A interface nunca bloqueia esperando rede.
-    """
-    curses.curs_set(0)      # esconde cursor
-    stdscr.nodelay(True)    # getch() não bloqueia — retorna ERR imediatamente
-    stdscr.keypad(True)     # decodifica teclas especiais (setas, F-keys, etc.)
+    """Loop da TUI: redesenha a tela e responde ao teclado."""
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.keypad(True)
     _init_colors()
 
-    # ── Iniciar MQTT em background ───────────────────────────────────────────
     client = start_mqtt()
     _add_log(f"Iniciando... Client ID: {CLIENT_ID}")
     _add_log(f"Broker: {BROKER_HOST}:{BROKER_PORT}")
 
-    # ── Estado da navegação da TUI ───────────────────────────────────────────
-    screen       = "dashboard"   # "dashboard" | "detail"
-    selected_idx = 0             # índice da vaga selecionada no dashboard
-    detail_id    = None          # id_vaga exibida na tela de detalhes
+    screen       = "dashboard"  # "dashboard" ou "detail"
+    selected_idx = 0
+    detail_id    = None
 
-    last_draw    = 0.0           # timestamp do último redesenho (monotonic)
-    REFRESH_SEC  = 1.0           # redesenho periódico mínimo (heartbeat visual)
+    last_draw   = 0.0
+    REFRESH_SEC = 1.0  # redesenho mínimo a cada 1 segundo
 
     try:
         while True:
             now = time.monotonic()
 
-            # ── Redesenho ────────────────────────────────────────────────────
-            # Redesenha quando: (a) evento MQTT setou needs_redraw, ou
-            # (b) passou mais de REFRESH_SEC desde o último desenho (heartbeat).
+            # Redesenha quando há novidade MQTT ou passou REFRESH_SEC
             if needs_redraw.is_set() or (now - last_draw) >= REFRESH_SEC:
                 needs_redraw.clear()
                 last_draw = now
 
-                # Garante que selected_idx não aponte para vaga inexistente
                 with state_lock:
                     n = len(vagas)
                 if n > 0:
@@ -559,20 +443,15 @@ def main(stdscr) -> None:
                 else:
                     draw_detail(stdscr, detail_id)
 
-            # ── Leitura de tecla (não-bloqueante) ────────────────────────────
             key = stdscr.getch()
 
             if key == curses.ERR:
-                # Nenhuma tecla pressionada — dorme brevemente para não
-                # consumir 100% de CPU no spin loop.
-                time.sleep(0.04)   # ~25 fps máximo de resposta a input
+                time.sleep(0.04)
                 continue
 
-            # ── Tecla global ─────────────────────────────────────────────────
             if key in (ord("q"), ord("Q")):
                 break
 
-            # ── Teclas do Dashboard ──────────────────────────────────────────
             if screen == "dashboard":
                 with state_lock:
                     vaga_list = sorted(vagas.values(), key=lambda v: v["id_vaga"])
@@ -590,14 +469,7 @@ def main(stdscr) -> None:
                     if n > 0:
                         detail_id = vaga_list[selected_idx]["id_vaga"]
                         screen = "detail"
-                        # Gatilho obrigatório: solicita estado atualizado da
-                        # vaga no exato momento em que o usuário abre a tela.
-                        # O comando 'status' é transparente — sem botão na UI.
-                        publish_command(
-                            client,
-                            TOPIC_CMD_VAGA.format(detail_id),
-                            "status",
-                        )
+                        publish_command(client, TOPIC_CMD_VAGA.format(detail_id), "status")
                         needs_redraw.set()
 
                 elif key in (ord("l"), ord("L")):
@@ -609,9 +481,8 @@ def main(stdscr) -> None:
                 elif key in (ord("a"), ord("A")):
                     publish_command(client, TOPIC_CMD_ALL, "auto")
 
-            # ── Teclas da Tela de Detalhes ───────────────────────────────────
             elif screen == "detail":
-                if key in (ord("b"), ord("B"), 27):   # 27 = Esc
+                if key in (ord("b"), ord("B"), 27):  # 27 = Esc
                     screen = "dashboard"
                     needs_redraw.set()
 
@@ -625,14 +496,11 @@ def main(stdscr) -> None:
                     publish_command(client, TOPIC_CMD_VAGA.format(detail_id), "auto")
 
     finally:
-        # Encerra graciosamente a thread MQTT antes de sair
         client.loop_stop()
         client.disconnect()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     curses.wrapper(main)
